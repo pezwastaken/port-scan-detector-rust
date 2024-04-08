@@ -6,6 +6,8 @@ use log::{debug, error, info, trace, warn};
 
 use env_logger::Env;
 use std::fs;
+use std::env;
+
 use std::hash::Hash;
 
 
@@ -97,6 +99,7 @@ impl Scanner{
         if !self.scanned_ports.contains(&port){
             self.scanned_ports.push(port);
             self.syn_count += 1;
+            self.window_end_timestamp += Duration::new(15, 0);
         }
     }
 
@@ -146,7 +149,6 @@ impl ScannersManager{
 
         self.scanners.get_mut(ip).unwrap().add_port(port);
 
-
         let is_scan = self.scanners.get(ip).unwrap().is_scan();
 
         //alert and downtime the scanner to avoid multiple alerts from being generated during the same scan
@@ -163,12 +165,15 @@ impl ScannersManager{
     }
 
     fn downtime_scanner(&mut self, ip: &String){
-        self.scanners.get_mut(ip).unwrap().downtime_end = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime") + Duration::new(80,0);
+        self.scanners.get_mut(ip).unwrap().downtime_end = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime") + Duration::new(120,0);
     }
 
 
     fn cleanup_routine(&mut self){
         self.scanners.retain(|_, v| !v.is_window_expired() && !v.is_in_downtime());
+
+        log::info!("keeping track of {} potential scanners", self.scanners.len());
+
     }
 
 }
@@ -297,7 +302,7 @@ impl Sniffer{
 
 
 
-        let mut cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime") + Duration::new(120, 0);
+        let mut cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime") + Duration::new(180, 0);
 
 
         loop{
@@ -308,7 +313,7 @@ impl Sniffer{
 
                     if SystemTime::now().duration_since(UNIX_EPOCH).unwrap() >= cleanup_time{
                         self.scanners_manager.cleanup_routine();
-                        cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::new(120, 0);
+                        cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::new(180, 0);
                     }
 
 
@@ -385,10 +390,13 @@ fn main() {
 
     env_logger::init_from_env(env);
 
-    let interface= "lo";
+    //let interface= "lo";
+    let interface_key = "RUST_SNIFFER_INTERFACE";
+    let interface = env::var(interface_key).unwrap_or("eth0".to_string());
 
+    log::info!("monitoring interface: {}", &interface);
 
-    let mut sniffer = Sniffer::new(interface);
+    let mut sniffer = Sniffer::new(&interface);
     sniffer.start();
 
 }
