@@ -1,23 +1,18 @@
 extern crate pnet;
 
-use std::collections::HashMap;
+use std::collections::{HashMap};
 use std::io::Read;
 use log::{debug, error, info, trace, warn};
-
 use env_logger::Env;
 use std::fs;
 use std::env;
-
 use std::hash::Hash;
-
-
 use pnet::datalink::{self, DataLinkReceiver, NetworkInterface};
 use pnet::datalink::Channel::Ethernet;
 use pnet::packet::{Packet, MutablePacket};
-use pnet::packet::ethernet::{EthernetPacket, MutableEthernetPacket};
+//use pnet::packet::ethernet::{EthernetPacket, MutableEthernetPacket};
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-//use pcap::{Active, Capture, Packet};
 
 
 
@@ -71,12 +66,15 @@ fn get_mac_address_from_bytes(buffer: &[u8]) -> u64{
 #[derive(Debug)]
 struct Scanner{
     syn_count: i32,
+    rst_count: i32,
     scanned_ports: Vec<u16>,
-    syn_threshold: i32,
+    scan_threshold: i32,
     window_len: i32,
     window_start_timestamp: Duration,       //now
     window_end_timestamp: Duration,     //40 seconds from now
     downtime_end: Duration,         //whenever the src_ip will end up in downtime this value will represent its duration
+    last_syn_timestamp: Duration,
+    last_syn_port: u16,
 }
 
 
@@ -85,12 +83,15 @@ impl Scanner{
     fn new() -> Scanner{
         Scanner{
             syn_count: 0,
+            rst_count: 0,
             scanned_ports: vec![],
-            syn_threshold: 30,
+            scan_threshold: 30,
             window_len: 40,
             window_start_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
             window_end_timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::new(40,0),
             downtime_end: Duration::ZERO,
+            last_syn_timestamp: Duration::ZERO,
+            last_syn_port: 0,
         }
     }
 
@@ -100,20 +101,33 @@ impl Scanner{
             self.scanned_ports.push(port);
             self.syn_count += 1;
             self.window_end_timestamp += Duration::new(15, 0);
+
+            self.last_syn_port = port;
+            self.last_syn_timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         }
     }
 
-    fn is_scan(&self) -> bool{
-        return self.syn_count >= self.syn_threshold;
+
+    fn is_scan(&self) -> (bool){
+        return self.syn_count + self.rst_count * 2 >= self.scan_threshold;
     }
 
     fn is_in_downtime(&self) -> bool{
         if self.downtime_end == Duration::ZERO {return false;}
-        return SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime").saturating_sub(self.downtime_end) == Duration::ZERO;
+        return SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving system time").saturating_sub(self.downtime_end) == Duration::ZERO;
     }
 
     fn is_window_expired(&self) -> bool{
-        return SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime").saturating_sub(self.window_end_timestamp) != Duration::ZERO;
+        return SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving system time").saturating_sub(self.window_end_timestamp) != Duration::ZERO;
+    }
+
+    //increase rst_count if less than 1.5 seconds passed between this rst and its syn
+    fn increase_rst_count(&mut self, port: u16){
+
+        match SystemTime::now().duration_since(UNIX_EPOCH).unwrap().saturating_sub(self.last_syn_timestamp) < Duration::new(1, 5*(10^8)) && port == self.last_syn_port {
+            true => self.rst_count += 1,
+            _ => (),
+        }
     }
 
 }
@@ -135,6 +149,10 @@ impl ScannersManager{
     }
 
 
+    fn increase_ip_rst_count(&mut self, ip: &String, port: u16){
+        self.scanners.get_mut(ip).unwrap().increase_rst_count(port);
+    }
+
     //add potential scanner to hashmap
     fn add_scanner(&mut self, ip: String, port: u16){
         let mut scanner = Scanner::new();
@@ -144,7 +162,7 @@ impl ScannersManager{
         self.scanners.insert(ip, scanner);      //add to hashmap
     }
 
-    //add scanned port to the ports vector associated with the src_ip. Alert if syn_threshold is reached
+    //add scanned port to the ports vector associated with the src_ip. Also alert if conditions are met
     fn add_port(&mut self, ip: &String, port: u16){
 
         self.scanners.get_mut(ip).unwrap().add_port(port);
@@ -158,22 +176,20 @@ impl ScannersManager{
         }
     }
 
+    //log alert
     fn alert(&self, ip: &String){
-        //log here
         info!("inbound scan by ip: {}", ip);
-
+        info!("scanner {} in downtime ({} seconds) to avoid message flooding", ip, 120);
     }
 
     fn downtime_scanner(&mut self, ip: &String){
-        self.scanners.get_mut(ip).unwrap().downtime_end = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime") + Duration::new(120,0);
+        self.scanners.get_mut(ip).unwrap().downtime_end = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving system time") + Duration::new(120,0);
     }
 
 
     fn cleanup_routine(&mut self){
         self.scanners.retain(|_, v| !v.is_window_expired() && !v.is_in_downtime());
-
-        log::info!("keeping track of {} potential scanners", self.scanners.len());
-
+        debug!("keeping track of {} potential scanners", self.scanners.len());
     }
 
 }
@@ -246,10 +262,9 @@ impl TCPHeader {
 
     fn is_src_ephemeral(&self) -> bool{ return self.src_port >= 1024; }
     fn is_flag_syn(&self) -> bool { return self.flags == 0x02;}
+    fn is_flag_rst(&self) -> bool { return self.flags == 0x04;}
 
 }
-
-
 
 
 
@@ -275,7 +290,7 @@ impl Sniffer{
             .unwrap();
 
         // Create a new channel, dealing with layer 2 packets
-        let (mut _tx, mut rx) = match datalink::channel(&interface, Default::default()) {
+        let (_tx, mut rx) = match datalink::channel(&interface, Default::default()) {
             Ok(Ethernet(_tx, rx)) => (_tx , rx),
             Ok(_) => panic!("Unhandled channel type"),
             Err(e) => panic!("An error occurred when creating the data link channel: {}", e)
@@ -291,19 +306,16 @@ impl Sniffer{
 
 
 
-    //listen raw socket
+    //listen raw socket and process incoming frames
     fn start(&mut self){
 
         info!("sniffer started");
-        let mac_addr_int = get_mac_address_from_str(String::from(&self.interface));
+        let _mac_addr_int = get_mac_address_from_str(String::from(&self.interface));
 
         //filter frames based on ether type
         let filter_ether_type = |arr: &[u8]| -> bool { arr[0] == 0x08 && arr[1] == 0x00 };
 
-
-
-        let mut cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving systemtime") + Duration::new(180, 0);
-
+        let mut cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).expect("error retrieving system time") + Duration::new(300, 0);
 
         loop{
             match self.receiver.next() {
@@ -313,7 +325,7 @@ impl Sniffer{
 
                     if SystemTime::now().duration_since(UNIX_EPOCH).unwrap() >= cleanup_time{
                         self.scanners_manager.cleanup_routine();
-                        cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::new(180, 0);
+                        cleanup_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap() + Duration::new(300, 0);
                     }
 
 
@@ -329,13 +341,13 @@ impl Sniffer{
                     if !ip_hdr.filter_protocol(){ continue; }
 
                     //tcp header starts at 14 + ip_hdr_len
-                    let ip_hdr_len = ip_hdr.ihl * 4;
+                    let tcp_header_start : usize = (14 + ip_hdr.ihl * 4) as usize;
 
                     //build tcp header from buffer slice
-                    let tcp_hdr: TCPHeader = TCPHeader::new(&buffer[ 34 .. ]);
-                    //only interested in syn packets, 0x02
-                    if !tcp_hdr.is_flag_syn(){ continue }
+                    let tcp_hdr: TCPHeader = TCPHeader::new(&buffer[ tcp_header_start .. ]);
 
+                    //only interested in syn and rst packets, 0x02 and 0x04
+                    if !tcp_hdr.is_flag_syn() && !tcp_hdr.is_flag_rst() { continue }
 
 
                     //process packet
@@ -356,21 +368,21 @@ impl Sniffer{
 
                         }
 
-                        self.scanners_manager.add_port(&ip_hdr.src_ip, tcp_hdr.dst_port);
-
+                        if tcp_hdr.is_flag_syn() {
+                            self.scanners_manager.add_port(&ip_hdr.src_ip, tcp_hdr.dst_port);
+                        }
+                        else{
+                            self.scanners_manager.increase_ip_rst_count(&ip_hdr.src_ip, tcp_hdr.dst_port);
+                        }
                     }
 
                     //new ip
                     if self.scanners_manager.is_new_ip(&ip_hdr.src_ip){
-
                         self.scanners_manager.add_scanner(ip_hdr.src_ip, tcp_hdr.dst_port);
-
                     }
 
-
-
                 }
-                Err(e) => {
+                Err(_e) => {
                     panic!("error while reading frame");
                 }
             }
@@ -390,11 +402,10 @@ fn main() {
 
     env_logger::init_from_env(env);
 
-    //let interface= "lo";
     let interface_key = "RUST_SNIFFER_INTERFACE";
     let interface = env::var(interface_key).unwrap_or("eth0".to_string());
 
-    log::info!("monitoring interface: {}", &interface);
+    info!("monitoring interface: {}", &interface);
 
     let mut sniffer = Sniffer::new(&interface);
     sniffer.start();
